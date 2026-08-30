@@ -1,0 +1,137 @@
+name: build-adblock-data
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: data
+  # brave-core 寫死的兩個 component id。其餘 id 全部來自 catalog。
+  CATALOG_ID: gkboaolpopklhgplhaaiboijnklogmbc
+  RESOURCES_ID: mfddibmblmbccpadfndgakiopmmhebop
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析上游 commit SHA
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "catalog=$(gh api repos/brave/adblock-resources/commits/master --jq .sha)" >> "$GITHUB_OUTPUT"
+          echo "mirror=$(gh api repos/brave/adblock-lists-mirror/commits/lists --jq .sha)" >> "$GITHUB_OUTPUT"
+
+      - name: 比對上一版 manifest，未變動就跳過
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p prev
+          if gh release download "$RELEASE_TAG" --dir prev --pattern 'manifest.json' 2>/dev/null; then
+            PREV_CATALOG=$(jq -r .catalog_sha prev/manifest.json)
+            PREV_MIRROR=$(jq -r .mirror_sha prev/manifest.json)
+          else
+            PREV_CATALOG=""
+            PREV_MIRROR=""
+          fi
+          if [ "$PREV_CATALOG" = "${{ steps.sha.outputs.catalog }}" ] \
+             && [ "$PREV_MIRROR" = "${{ steps.sha.outputs.mirror }}" ]; then
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+            echo "上游未變動，跳過本次建置。"
+          else
+            echo "unchanged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 下載上一版全部 assets 當基底
+        if: steps.prev.outputs.unchanged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$RELEASE_TAG" --dir prev --clobber || true
+
+      - uses: actions/setup-node@v4
+        if: steps.prev.outputs.unchanged == 'false'
+        with:
+          node-version: '20'
+
+      - name: 取得官方 packager（uBlock 是 submodule，必須遞迴）
+        if: steps.prev.outputs.unchanged == 'false'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules \
+            https://github.com/brave/brave-core-crx-packager.git packager
+
+      - name: 跑官方腳本
+        if: steps.prev.outputs.unchanged == 'false'
+        working-directory: packager
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run data-files-ad-block-rust -- --commit-hash "${{ steps.sha.outputs.mirror }}"
+
+      - name: 攤平產物，以上一版為基底覆蓋
+        if: steps.prev.outputs.unchanged == 'false'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # 基底：上一版的 assets。官方語意是「某來源抓失敗時該清單不重新產生」，
+          # 對應到我們這裡就是沿用舊版，而不是讓那個 asset 消失。
+          cp prev/* dist/ 2>/dev/null || true
+          rm -f dist/manifest.json
+
+          shopt -s nullglob
+          count=0
+          for d in packager/build/ad-block-updater/*/; do
+            id=$(basename "$d")
+            case "$id" in
+              # 這個目錄裡同時有 list_catalog.json 與 legacy 的
+              # regional_catalog.json，必須明確指定要哪一個。
+              "$CATALOG_ID")   src="${d}list_catalog.json" ;;
+              "$RESOURCES_ID") src="${d}resources.json" ;;
+              *)               src="${d}list.txt" ;;
+            esac
+            if [ ! -f "$src" ]; then
+              echo "::warning::缺少 $src，沿用上一版"
+              continue
+            fi
+            cp "$src" "dist/$id"
+            count=$((count + 1))
+          done
+          echo "本次產出 $count 個 component"
+
+          # catalog 與 resources 是硬性依賴：少了它們，瀏覽器連清單目錄都沒有。
+          for required in "$CATALOG_ID" "$RESOURCES_ID"; do
+            if [ ! -s "dist/$required" ]; then
+              echo "::error::$required 不存在或為空，中止上傳"
+              exit 1
+            fi
+          done
+
+          jq -n \
+            --arg catalog "${{ steps.sha.outputs.catalog }}" \
+            --arg mirror "${{ steps.sha.outputs.mirror }}" \
+            --arg built "$(date -u +%FT%TZ)" \
+            --argjson produced "$count" \
+            '{catalog_sha:$catalog, mirror_sha:$mirror, built_at:$built, components_produced:$produced}' \
+            > dist/manifest.json
+          ls -la dist/
+
+      - name: 覆蓋上傳到固定 tag
+        if: steps.prev.outputs.unchanged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --title "adblock data" \
+                 --notes "由 workflow 自動產生，請勿手動編輯。"
+          gh release upload "$RELEASE_TAG" dist/* --clobber
