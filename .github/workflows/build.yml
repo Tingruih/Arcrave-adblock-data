@@ -60,7 +60,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: steps.prev.outputs.unchanged == 'false'
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: 取得官方 packager（uBlock 是 submodule，必須遞迴）
         if: steps.prev.outputs.unchanged == 'false'
