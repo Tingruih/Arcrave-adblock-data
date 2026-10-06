@@ -74,8 +74,11 @@ jobs:
         working-directory: packager
         run: |
           set -euo pipefail
-          npm ci
-          npm run data-files-ad-block-rust -- --commit-hash "${{ steps.sha.outputs.mirror }}"
+          # 上游使用 pnpm（packageManager 欄位 + pnpm-lock.yaml），沒有 package-lock.json，
+          # 所以不能用 npm ci。corepack 會依 packageManager 欄位取得對應版本的 pnpm。
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run data-files-ad-block-rust -- --commit-hash "${{ steps.sha.outputs.mirror }}"
 
       - name: 攤平產物，以上一版為基底覆蓋
         if: steps.prev.outputs.unchanged == 'false'
